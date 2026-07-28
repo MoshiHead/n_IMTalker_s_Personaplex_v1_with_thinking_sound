@@ -163,6 +163,10 @@ cython_debug/
 Cargo.lock
 *~
 *.safetensors
+*.wav
+# Live-pipeline asset, not a build artifact -- must stay tracked or the
+# RAG "thinking sound" silently has nothing to play on a fresh clone.
+!ai-thinking-sound.wav
 trace*.json
 *.flac
 pkg
@@ -170,6 +174,7 @@ pkg
 *.sqlite
 *.pem
 *.tgz
+*.mp3
 *.ogg
 /moshi-demo/config.sh
 log.*
