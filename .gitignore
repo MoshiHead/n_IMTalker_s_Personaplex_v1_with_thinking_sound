@@ -29,6 +29,6 @@ IMTalker/checkpoints/
 *.tar
 *.zst
 *.mp4
-*.wav
+# *.wav
 *.npy
 # *.npz
