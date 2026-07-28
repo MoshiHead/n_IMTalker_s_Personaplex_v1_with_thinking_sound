@@ -89,6 +89,7 @@ if [[ "$ENABLE_RAG" == "1" ]]; then
     "$PROJECT_ROOT/personaplex/rag_index")}"
   STT_PKG_DIR="${STT_PKG_DIR:-$PROJECT_ROOT/checkpoints/stt}"
   CONVERSATION_LOG_DIR="${CONVERSATION_LOG_DIR:-$PROJECT_ROOT/conversation_logs}"
+  THINKING_SOUND_PATH="${THINKING_SOUND_PATH:-$PROJECT_ROOT/personaplex/ai-thinking-sound.wav}"
   RAG_ARGS=(
     --conversation_log_dir "$CONVERSATION_LOG_DIR"
     --rag_checkpoint_dir "$RAG_CHECKPOINT_DIR"
@@ -98,11 +99,12 @@ if [[ "$ENABLE_RAG" == "1" ]]; then
     --vad_threshold "${VAD_THRESHOLD:-0.5}"
     --compressor_model "${COMPRESSOR_MODEL:-Qwen/Qwen2.5-1.5B-Instruct}"
     --compressor_device "${COMPRESSOR_DEVICE:-cuda}"
+    --thinking_sound_path "$THINKING_SOUND_PATH"
   )
   if [[ "${WEB_SEARCH_ENABLED:-0}" == "1" ]]; then
     RAG_ARGS+=(--web_search_enabled --web_search_api_key "${WEB_SEARCH_API_KEY:?set WEB_SEARCH_API_KEY when WEB_SEARCH_ENABLED=1}")
   fi
-  echo "RAG enabled: checkpoint=$RAG_CHECKPOINT_DIR index=$RAG_INDEX_DIR stt_pkg=$STT_PKG_DIR web_search=${WEB_SEARCH_ENABLED:-0} conversation_log_dir=$CONVERSATION_LOG_DIR"
+  echo "RAG enabled: checkpoint=$RAG_CHECKPOINT_DIR index=$RAG_INDEX_DIR stt_pkg=$STT_PKG_DIR web_search=${WEB_SEARCH_ENABLED:-0} conversation_log_dir=$CONVERSATION_LOG_DIR thinking_sound=$THINKING_SOUND_PATH"
 else
   RAG_ARGS=()
 fi

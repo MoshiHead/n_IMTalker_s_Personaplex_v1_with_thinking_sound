@@ -192,10 +192,58 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
     replay enabled. We do not use Python forward hooks in this path.
     """
 
-    def __init__(self, *args, capture_layer: int = -2, **kwargs) -> None:
+    def __init__(self, *args, capture_layer: int = -2, thinking_sound_path: str = "", **kwargs) -> None:
         self.tf_capture_layer = int(capture_layer)
         super().__init__(*args, **kwargs)
+
+        # RAG "thinking sound": played in place of the model's own audio while
+        # a RAG/web search retrieval is in flight (see _rag_start_turn /
+        # _rag_consume_pending_ref / _step below). Loaded once here via the
+        # same resample-to-24kHz-mono helper used for --audio_path.
+        self.thinking_sound_pcm: np.ndarray | None = None
+        self._thinking_sound_cursor = 0
+        if thinking_sound_path:
+            if Path(thinking_sound_path).is_file():
+                try:
+                    self.thinking_sound_pcm = load_audio_24k(thinking_sound_path)
+                    print(
+                        f"[liveTryPlasticity][RAG] thinking sound loaded: {thinking_sound_path} "
+                        f"({self.thinking_sound_pcm.shape[0] / TARGET_SR:.2f}s)",
+                        flush=True,
+                    )
+                except Exception as e:
+                    tb = traceback.format_exc()
+                    print(
+                        f"[liveTryPlasticity][RAG] failed to load thinking sound "
+                        f"{thinking_sound_path!r}: {e!r}\n{tb}",
+                        flush=True,
+                    )
+                    self.conv_logger.error("thinking_sound_load", e, tb)
+                    self.thinking_sound_pcm = None
+            else:
+                print(
+                    f"[liveTryPlasticity][RAG] thinking sound path not found: {thinking_sound_path} "
+                    f"-- will stay silent during RAG search instead",
+                    flush=True,
+                )
+
         self._install_graph_hidden_capture()
+
+    def _next_thinking_sound_chunk(self) -> np.ndarray:
+        """Next MIMI_FRAME_SIZE samples of the thinking sound, looping
+        seamlessly. Advances self._thinking_sound_cursor."""
+        pcm = self.thinking_sound_pcm
+        n = pcm.shape[0]
+        out = np.empty(MIMI_FRAME_SIZE, dtype=np.float32)
+        pos = 0
+        cursor = self._thinking_sound_cursor % n
+        while pos < MIMI_FRAME_SIZE:
+            take = min(MIMI_FRAME_SIZE - pos, n - cursor)
+            out[pos:pos + take] = pcm[cursor:cursor + take]
+            pos += take
+            cursor = (cursor + take) % n
+        self._thinking_sound_cursor = cursor
+        return out
 
     def _install_graph_hidden_capture(self) -> None:
         lm_model = self.lm
@@ -414,6 +462,9 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         # response for THIS turn can be recovered as audio_text[snapshot:]
         # once the next user utterance starts (see _rag_stt_step).
         self._rag_turn_start_audio_text_len = 0
+        # "Thinking sound" playback state (see _next_thinking_sound_chunk / _step).
+        self.rag_thinking_active = False
+        self._thinking_sound_cursor = 0
 
     def _rag_inject_tokens(self, tokens: list[int]) -> None:
         """Force-feed text tokens via the PUBLIC lm_gen.step() (not the
@@ -524,6 +575,13 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         self.rag_current_transcript = transcript
         self.rag_pending_ref_tokens = None
         self._rag_turn_start_audio_text_len = len(self.audio_text)
+
+        # Start the "thinking" audio immediately -- covers both the lookup
+        # injection below and the retrieval/compression that follows on the
+        # background thread. Silently no-ops if the WAV failed to load.
+        if self.thinking_sound_pcm is not None:
+            self.rag_thinking_active = True
+            self.conv_logger.event("thinking_sound_start", transcript=transcript)
 
         t_lookup0 = time.perf_counter()
         lookup_tokens = self.tokenizer.encode(rag_helpers.wrap_with_lookup_tags())
@@ -640,6 +698,13 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
             self.rag_pending_ref_tokens = None
             self.rag_awaiting_ref = False
             self.rag_ref_committed_this_turn = True
+            # Stop the thinking sound BEFORE injecting -- the injection burst
+            # itself produces no audio (forced-token steps bypass decode), so
+            # the very next normal generation step in this same _step() call
+            # is the model's real, grounded reply: no silent gap, no overlap.
+            if self.rag_thinking_active:
+                self.rag_thinking_active = False
+                self.conv_logger.event("thinking_sound_stop", reason="ref_ready")
             t0 = time.perf_counter()
             self._rag_inject_tokens(ref_tokens)
             self.conv_logger.ref_injected(
@@ -655,6 +720,9 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
             fallback = self.tokenizer.encode(rag_helpers.wrap_with_ref_tags(fallback_text))
             self.rag_awaiting_ref = False
             self.rag_ref_committed_this_turn = True
+            if self.rag_thinking_active:
+                self.rag_thinking_active = False
+                self.conv_logger.event("thinking_sound_stop", reason="filler_timeout")
             t0 = time.perf_counter()
             self._rag_inject_tokens(fallback)
             self.conv_logger.ref_injected(fallback_text, len(fallback), time.perf_counter() - t0, kind="ref_fallback")
@@ -715,6 +783,19 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
             elif reply_pcm.shape[0] > MIMI_FRAME_SIZE:
                 reply_pcm = reply_pcm[:MIMI_FRAME_SIZE]
 
+        # RAG "thinking sound": while a retrieval/web-search is in flight,
+        # replace whatever the model would otherwise output with the looped
+        # thinking-sound clip. The model keeps stepping normally above (KV
+        # cache / timing untouched); only the audio actually sent out is
+        # swapped. force_idle tells the avatar-motion gate downstream (in
+        # _gpu_producer_thread) to stay visually idle rather than lip-syncing
+        # to this non-speech sound (its real RMS is well above the speech
+        # threshold, so without this the avatar would appear to "talk").
+        force_idle = False
+        if self.rag_thinking_active and self.thinking_sound_pcm is not None:
+            reply_pcm = self._next_thinking_sound_chunk()
+            force_idle = True
+
         reply_rms = float(np.sqrt(np.mean(np.square(reply_pcm, dtype=np.float32))))
         reply_peak = float(np.max(np.abs(reply_pcm))) if reply_pcm.size else 0.0
         input_rms = float(np.sqrt(np.mean(np.square(pcm24, dtype=np.float32))))
@@ -741,6 +822,7 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
             "reply_i16_b64": audio_b64,
             "reply_rms": reply_rms,
             "reply_peak": reply_peak,
+            "force_idle": force_idle,
             "input_rms": input_rms,
             "token": token,
             "piece": token_piece,
@@ -2146,6 +2228,13 @@ class LiveHeliumFMOptions(BaseOptions):
         parser.add_argument("--web_search_trigger_below", type=float, default=0.45)
         parser.add_argument("--web_search_timeout", type=float, default=3.0)
         parser.add_argument(
+            "--thinking_sound_path",
+            default=str(ROOT.parent / "personaplex" / "ai-thinking-sound.wav"),
+            help="WAV played over the assistant audio channel while a RAG/web-search retrieval "
+                 "is in flight (looped if shorter than the wait, stopped the instant the "
+                 "grounded <ref> is injected). Set to '' to disable.",
+        )
+        parser.add_argument(
             "--conversation_log_dir", default="",
             help="Directory for structured per-session conversation logs (user transcripts, "
                  "RAG retrieval, web search, compressor prompts/responses, assistant responses, "
@@ -2297,6 +2386,7 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                 web_search_trigger_below=float(getattr(args, "web_search_trigger_below", 0.45)),
                 web_search_timeout=float(getattr(args, "web_search_timeout", 3.0)),
                 conversation_log_dir=getattr(args, "conversation_log_dir", ""),
+                thinking_sound_path=getattr(args, "thinking_sound_path", ""),
             )
         return moshi_engine
 
@@ -2661,14 +2751,25 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                             speech_threshold = float(
                                 getattr(args, "assistant_speech_rms_threshold", 0.006)
                             )
-                            assistant_active_now = max(reply_rms, step_rms) > speech_threshold
-                            if assistant_active_now:
-                                assistant_gate_hold = max(
-                                    0,
-                                    int(getattr(args, "assistant_speech_hold_chunks", 1)),
-                                )
-                            elif assistant_gate_hold > 0:
-                                assistant_gate_hold -= 1
+                            # RAG "thinking sound" is real (non-speech) audio played
+                            # over the assistant channel -- its RMS is well above
+                            # speech_threshold, so without this override the gate
+                            # below would misread it as the assistant talking and
+                            # animate the avatar accordingly. force_idle keeps the
+                            # avatar visually idle (silence_helium_seed) while it plays.
+                            force_idle_window = any(bool(s.get("force_idle")) for s in used_steps)
+                            if force_idle_window:
+                                assistant_active_now = False
+                                assistant_gate_hold = 0
+                            else:
+                                assistant_active_now = max(reply_rms, step_rms) > speech_threshold
+                                if assistant_active_now:
+                                    assistant_gate_hold = max(
+                                        0,
+                                        int(getattr(args, "assistant_speech_hold_chunks", 1)),
+                                    )
+                                elif assistant_gate_hold > 0:
+                                    assistant_gate_hold -= 1
                             assistant_active = assistant_active_now or assistant_gate_hold > 0
                             if bool(getattr(args, "disable_assistant_output_gate", False)):
                                 assistant_active = True
