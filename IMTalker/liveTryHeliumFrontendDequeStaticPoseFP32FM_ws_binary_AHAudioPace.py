@@ -231,7 +231,9 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
 
     def _next_thinking_sound_chunk(self) -> np.ndarray:
         """Next MIMI_FRAME_SIZE samples of the thinking sound, looping
-        seamlessly. Advances self._thinking_sound_cursor."""
+        seamlessly. Advances self._thinking_sound_cursor and
+        self._thinking_sound_play_count (incremented every time the clip
+        wraps back to its start, i.e. every completed extra play-through)."""
         pcm = self.thinking_sound_pcm
         n = pcm.shape[0]
         out = np.empty(MIMI_FRAME_SIZE, dtype=np.float32)
@@ -241,9 +243,31 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
             take = min(MIMI_FRAME_SIZE - pos, n - cursor)
             out[pos:pos + take] = pcm[cursor:cursor + take]
             pos += take
-            cursor = (cursor + take) % n
+            new_cursor = (cursor + take) % n
+            if new_cursor < cursor or (new_cursor == 0 and take > 0):
+                self._thinking_sound_play_count += 1
+            cursor = new_cursor
         self._thinking_sound_cursor = cursor
         return out
+
+    def _stop_thinking_sound(self, turn_id, reason: str, reason_text: str) -> None:
+        """Shared stop logic for both the real-ref-ready and filler-timeout
+        paths in _rag_consume_pending_ref -- keeps duration/loop-count
+        bookkeeping in one place."""
+        if not self.rag_thinking_active:
+            return
+        self.rag_thinking_active = False
+        duration_s = max(0.0, time.perf_counter() - self._thinking_sound_started_at)
+        clip_duration_s = (
+            self.thinking_sound_pcm.shape[0] / TARGET_SR if self.thinking_sound_pcm is not None else 0.0
+        )
+        self.conv_logger.event(
+            "thinking_sound_stop", reason=reason, duration_s=round(duration_s, 2),
+            play_count=self._thinking_sound_play_count,
+        )
+        self.conv_logger.narrate_thinking_stop(
+            turn_id, reason_text, duration_s, self._thinking_sound_play_count, clip_duration_s
+        )
 
     def _install_graph_hidden_capture(self) -> None:
         lm_model = self.lm
@@ -455,6 +479,7 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         self.rag_ref_committed_this_turn = False
         self.rag_awaiting_ref = False
         self.rag_pending_ref_tokens: list | None = None
+        self._rag_pending_ref_token_counts = (0, 0)
         self.rag_filler_frame_count = 0
         self.rag_session_history: list[tuple[str, str]] = []
         self.rag_current_transcript = ""
@@ -465,6 +490,8 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         # "Thinking sound" playback state (see _next_thinking_sound_chunk / _step).
         self.rag_thinking_active = False
         self._thinking_sound_cursor = 0
+        self._thinking_sound_started_at = 0.0
+        self._thinking_sound_play_count = 0
 
     def _rag_inject_tokens(self, tokens: list[int]) -> None:
         """Force-feed text tokens via the PUBLIC lm_gen.step() (not the
@@ -521,10 +548,12 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
                 prev_response = self.audio_text[self._rag_turn_start_audio_text_len:].strip()
                 if prev_response:
                     self.conv_logger.assistant_response(self.rag_current_transcript, prev_response)
+                    self.conv_logger.narrate_response(self.rag_turn_epoch, self.rag_current_transcript, prev_response)
                     if self.rag_current_transcript:
                         self.rag_session_history.append((self.rag_current_transcript, prev_response))
                         self.rag_session_history = self.rag_session_history[-6:]
                 self.conv_logger.user_transcript(transcript, self.rag_turn_epoch + 1)
+                self.conv_logger.narrate_user_message(self.rag_turn_epoch + 1, transcript)
                 with contextlib.suppress(Exception):
                     self.stt_lm_gen.reset_streaming()
                     self.stt_mimi.reset_streaming()
@@ -558,6 +587,9 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         QUICK_GATE_MARGIN = 0.03
         triggered = not (top_score < (self.rag_min_score - QUICK_GATE_MARGIN) and not lexical_hit)
         self.conv_logger.rag_gate(transcript, top_score, lexical_hit, triggered)
+        self.conv_logger.narrate_decision(
+            self.rag_turn_epoch + 1, top_score, self.rag_min_score, lexical_hit, triggered
+        )
         if not triggered:
             print(f"[liveTryPlasticity][RAG] casual turn (top={top_score:.3f}) -- no <ref>", flush=True)
             # Still mark the turn boundary so per-turn response logging in
@@ -581,7 +613,10 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         # background thread. Silently no-ops if the WAV failed to load.
         if self.thinking_sound_pcm is not None:
             self.rag_thinking_active = True
+            self._thinking_sound_started_at = time.perf_counter()
+            self._thinking_sound_play_count = 1
             self.conv_logger.event("thinking_sound_start", transcript=transcript)
+            self.conv_logger.narrate_thinking_start(my_epoch)
 
         t_lookup0 = time.perf_counter()
         lookup_tokens = self.tokenizer.encode(rag_helpers.wrap_with_lookup_tags())
@@ -611,14 +646,27 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         import rag_helpers
 
         try:
+            doc_sources = list(dict.fromkeys(c.get("source", "unknown") for c in self.rag_chunks))
+            self.conv_logger.narrate_doc_search_start(my_epoch, transcript, len(self.rag_chunks), doc_sources)
+
             t_local0 = time.perf_counter()
             hits = rag_helpers.retrieve_chunks_hierarchical_fast(
                 transcript, self.rag_chunks, self.rag_index, self.rag_embeddings_t,
                 self.rag_embedding_model, self.rag_top_k, min_score=self.rag_min_score,
             )
             self.conv_logger.retrieval(transcript, "local", hits, time.perf_counter() - t_local0)
+            self.conv_logger.narrate_doc_search_results(my_epoch, hits)
+            hits_source = "your documents"
             top_score = max((h["similarity_score"] for h in hits), default=0.0)
             if self.web_search_enabled and top_score < self.web_search_trigger_below:
+                web_reason = (
+                    f"the documents didn't have a strong enough match (best match "
+                    f"{top_score:.3f}, below the {self.web_search_trigger_below:.3f} needed "
+                    f"to trust it), so the assistant is also checking the web"
+                )
+                self.conv_logger.narrate_web_search_start(
+                    my_epoch, transcript, self.web_search_provider, web_reason
+                )
                 t_web0 = time.perf_counter()
                 web_hits = rag_helpers.web_search_query_sync(
                     transcript, self.web_search_api_key, self.web_search_provider,
@@ -630,10 +678,15 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
                     triggered_reason=f"local top_score={top_score:.3f} < trigger={self.web_search_trigger_below}",
                 )
                 if web_hits:
-                    hits = sorted(web_hits, key=lambda c: c["similarity_score"], reverse=True)[
-                        : self.web_search_max_results
-                    ]
+                    sorted_web_hits = sorted(web_hits, key=lambda c: c["similarity_score"], reverse=True)
+                    hits = sorted_web_hits[: self.web_search_max_results]
                     self.conv_logger.retrieval(transcript, "web", hits, web_elapsed)
+                    self.conv_logger.narrate_web_search_results(
+                        my_epoch, sorted_web_hits, hits, self.web_search_max_results
+                    )
+                    hits_source = "a web search"
+                else:
+                    self.conv_logger.narrate_web_search_results(my_epoch, [], [], self.web_search_max_results)
 
             if my_epoch != self.rag_turn_epoch:
                 return  # superseded by a newer turn (e.g. barge-in)
@@ -649,6 +702,8 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
                     transcript, [h.get("text", "") for h in hits[:2]], grounding,
                     time.perf_counter() - t_compress0, used_fallback=False,
                 )
+                if grounding:
+                    self.conv_logger.narrate_summary(my_epoch, hits_source, len(hits), grounding, used_fallback=False)
             if not grounding and hits:
                 used_fallback = True
                 t_fallback0 = time.perf_counter()
@@ -659,6 +714,10 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
                     transcript, [h.get("text", "") for h in hits[:2]], grounding,
                     time.perf_counter() - t_fallback0, used_fallback=True,
                 )
+                if grounding:
+                    self.conv_logger.narrate_summary(my_epoch, hits_source, len(hits), grounding, used_fallback=True)
+            if not grounding:
+                self.conv_logger.narrate_no_information(my_epoch)
 
             if my_epoch != self.rag_turn_epoch or self.rag_ref_committed_this_turn:
                 return
@@ -666,11 +725,19 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
             ref_content = grounding.strip() if grounding else (
                 "There's no specific information available on this, so answer from general knowledge."
             )
-            ids = self.tokenizer.encode(ref_content)
+            ids_before_trim = self.tokenizer.encode(ref_content)
+            ids = ids_before_trim
             if len(ids) > self.max_ref_tokens:
                 ids = ids[: self.max_ref_tokens]
                 ref_content = self.tokenizer.decode(ids)
-            self.rag_pending_ref_tokens = self.tokenizer.encode(rag_helpers.wrap_with_ref_tags(ref_content))
+            new_ref_tokens = self.tokenizer.encode(rag_helpers.wrap_with_ref_tags(ref_content))
+            # Set the metadata BEFORE the token list itself: the GPU thread's
+            # _rag_consume_pending_ref polls `rag_pending_ref_tokens is not
+            # None` as its readiness signal, so the counts must already be
+            # in place by the time that becomes true (avoids a narrow race
+            # where the GPU thread reads stale/default counts).
+            self._rag_pending_ref_token_counts = (len(ids_before_trim), self.max_ref_tokens)
+            self.rag_pending_ref_tokens = new_ref_tokens
             print(
                 f"[liveTryPlasticity][RAG] prepared <ref> block "
                 f"({len(self.rag_pending_ref_tokens)} tok): {ref_content[:150]!r}",
@@ -680,10 +747,13 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
             tb = traceback.format_exc()
             print(f"[liveTryPlasticity][RAG] retrieval/compression failed: {e!r}\n{tb}", flush=True)
             self.conv_logger.error("rag_retrieve_and_compress", e, tb)
+            self.conv_logger.narrate_no_information(my_epoch)
             if my_epoch == self.rag_turn_epoch:
-                self.rag_pending_ref_tokens = self.tokenizer.encode(rag_helpers.wrap_with_ref_tags(
+                fallback_tokens = self.tokenizer.encode(rag_helpers.wrap_with_ref_tags(
                     "There's no specific information available on this, so answer from general knowledge."
                 ))
+                self._rag_pending_ref_token_counts = (len(fallback_tokens), self.max_ref_tokens)
+                self.rag_pending_ref_tokens = fallback_tokens
 
     def _rag_consume_pending_ref(self) -> None:
         """Called once per chunk while awaiting a background retrieval result.
@@ -702,13 +772,14 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
             # itself produces no audio (forced-token steps bypass decode), so
             # the very next normal generation step in this same _step() call
             # is the model's real, grounded reply: no silent gap, no overlap.
-            if self.rag_thinking_active:
-                self.rag_thinking_active = False
-                self.conv_logger.event("thinking_sound_stop", reason="ref_ready")
+            self._stop_thinking_sound(self.rag_turn_epoch, "ref_ready", "the answer was ready")
             t0 = time.perf_counter()
             self._rag_inject_tokens(ref_tokens)
-            self.conv_logger.ref_injected(
-                self.tokenizer.decode(ref_tokens), len(ref_tokens), time.perf_counter() - t0, kind="ref"
+            elapsed = time.perf_counter() - t0
+            self.conv_logger.ref_injected(self.tokenizer.decode(ref_tokens), len(ref_tokens), elapsed, kind="ref")
+            n_before, max_tok = self._rag_pending_ref_token_counts
+            self.conv_logger.narrate_injection(
+                self.rag_turn_epoch, self.tokenizer.decode(ref_tokens), len(ref_tokens), n_before, max_tok, kind="ref"
             )
             print(
                 f"[liveTryPlasticity][RAG] <ref> injected ({len(ref_tokens)} tok) "
@@ -720,12 +791,16 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
             fallback = self.tokenizer.encode(rag_helpers.wrap_with_ref_tags(fallback_text))
             self.rag_awaiting_ref = False
             self.rag_ref_committed_this_turn = True
-            if self.rag_thinking_active:
-                self.rag_thinking_active = False
-                self.conv_logger.event("thinking_sound_stop", reason="filler_timeout")
+            self._stop_thinking_sound(
+                self.rag_turn_epoch, "filler_timeout",
+                "the search was taking too long, so the assistant moved on with what it had",
+            )
             t0 = time.perf_counter()
             self._rag_inject_tokens(fallback)
             self.conv_logger.ref_injected(fallback_text, len(fallback), time.perf_counter() - t0, kind="ref_fallback")
+            self.conv_logger.narrate_injection(
+                self.rag_turn_epoch, fallback_text, len(fallback), len(fallback), self.max_ref_tokens, kind="ref_fallback"
+            )
             print("[liveTryPlasticity][RAG] <ref> fallback injected after filler timeout", flush=True)
 
     @torch.no_grad()
