@@ -522,6 +522,9 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         # RAG is skipped for the rest of THIS session but the underlying
         # avatar conversation keeps working.
         self.rag_hard_disabled = False
+        # Per-turn stage-timing accumulator, see _rag_start_turn / _rag_log_timing_summary.
+        self._rag_turn_timing_start: float | None = None
+        self._rag_turn_timing_stages: dict[str, float] = {}
         self.rag_pending_ref_tokens: list | None = None
         self._rag_pending_ref_token_counts = (0, 0)
         self.rag_filler_frame_count = 0
@@ -627,6 +630,20 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
                     if self.rag_current_transcript:
                         self.rag_session_history.append((self.rag_current_transcript, prev_response))
                         self.rag_session_history = self.rag_session_history[-6:]
+                elif self.rag_current_transcript:
+                    # The model produced zero spoken text for the previous
+                    # turn before the user spoke again. Previously this left
+                    # no trace anywhere in either log -- confirmed in
+                    # conversation_logs_6, where "Can you hear me?" (turn 1)
+                    # got no logged response at all and the only way to find
+                    # that was to notice an assistant_response line was
+                    # missing. Flagged explicitly now so it's never silent.
+                    turn_start_perf = self._rag_turn_timing_start
+                    gap_s = max(0.0, time.perf_counter() - turn_start_perf) if turn_start_perf else 0.0
+                    self.conv_logger.no_response_warning(self.rag_turn_epoch, self.rag_current_transcript, gap_s)
+                    self.conv_logger.narrate_no_response_warning(
+                        self.rag_turn_epoch, self.rag_current_transcript, gap_s
+                    )
                 self.conv_logger.user_transcript(transcript, self.rag_turn_epoch + 1)
                 self.conv_logger.narrate_user_message(self.rag_turn_epoch + 1, transcript)
                 with contextlib.suppress(Exception):
@@ -642,8 +659,17 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         real retrieval + compression + optional web search."""
         import rag_helpers
 
+        # Per-turn stage-timing accumulator (see rag_timing_summary at the end
+        # of _rag_consume_pending_ref). Safe as a plain instance attribute:
+        # rag_awaiting_ref gates re-entry, so only one turn's timing is ever
+        # in flight at once, same as rag_pending_ref_tokens below.
+        t_turn_start = time.perf_counter()
+        self._rag_turn_timing_start = t_turn_start
+        self._rag_turn_timing_stages: dict[str, float] = {}
+
         if not self.rag_chunks:
             return
+        t_gate0 = time.perf_counter()
         q = self.rag_embedding_model.encode(transcript, normalize_embeddings=True).astype(np.float32)
         k = min(3, len(self.rag_chunks))
         scores, indices = self.rag_index.search(q.reshape(1, -1), k)
@@ -658,6 +684,9 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
             if len(query_words & chunk_words) >= 2:
                 lexical_hit = True
                 break
+        gate_elapsed = time.perf_counter() - t_gate0
+        self._rag_turn_timing_stages["quick_gate"] = gate_elapsed
+        self.conv_logger.quick_gate_timing(gate_elapsed)
 
         QUICK_GATE_MARGIN = 0.03
         effective_gate_threshold = self.rag_min_score - QUICK_GATE_MARGIN
@@ -713,8 +742,10 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         t_lookup0 = time.perf_counter()
         lookup_tokens = self.tokenizer.encode(rag_helpers.wrap_with_lookup_tags())
         self._rag_inject_tokens(lookup_tokens)
+        lookup_elapsed = time.perf_counter() - t_lookup0
+        self._rag_turn_timing_stages["lookup_inject"] = lookup_elapsed
         self.conv_logger.ref_injected(
-            rag_helpers.wrap_with_lookup_tags(), len(lookup_tokens), time.perf_counter() - t_lookup0, kind="lookup"
+            rag_helpers.wrap_with_lookup_tags(), len(lookup_tokens), lookup_elapsed, kind="lookup"
         )
         print(
             f"[liveTryPlasticity][RAG] <lookup> injected ({len(lookup_tokens)} tok) "
@@ -746,7 +777,9 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
                 transcript, self.rag_chunks, self.rag_index, self.rag_embeddings_t,
                 self.rag_embedding_model, self.rag_top_k, min_score=self.rag_min_score,
             )
-            self.conv_logger.retrieval(transcript, "local", hits, time.perf_counter() - t_local0)
+            local_elapsed = time.perf_counter() - t_local0
+            self._rag_turn_timing_stages["local_retrieval"] = local_elapsed
+            self.conv_logger.retrieval(transcript, "local", hits, local_elapsed)
             self.conv_logger.narrate_doc_search_results(my_epoch, hits)
             hits_source = "your documents"
             top_score = max((h["similarity_score"] for h in hits), default=0.0)
@@ -771,6 +804,7 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
                     self.web_search_max_results, self.web_search_timeout,
                 )
                 web_elapsed = time.perf_counter() - t_web0
+                self._rag_turn_timing_stages["web_search"] = web_elapsed
                 self.conv_logger.web_search(
                     transcript, self.web_search_provider, len(web_hits), web_elapsed,
                     triggered_reason=f"local top_score={top_score:.3f} < trigger={self.web_search_trigger_below}",
@@ -820,9 +854,13 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
             t_compress0 = time.perf_counter()
             if hits and self.context_compressor is not None:
                 grounding = self.context_compressor.compress(question=transcript, chunks=hits)
+                primary_elapsed = time.perf_counter() - t_compress0
+                self._rag_turn_timing_stages["compression"] = (
+                    self._rag_turn_timing_stages.get("compression", 0.0) + primary_elapsed
+                )
                 self.conv_logger.compressor_call(
                     transcript, [h.get("text", "") for h in hits[:2]], grounding,
-                    time.perf_counter() - t_compress0, used_fallback=False,
+                    primary_elapsed, used_fallback=False,
                 )
                 if grounding:
                     self.conv_logger.narrate_summary(my_epoch, hits_source, len(hits), grounding, used_fallback=False)
@@ -832,9 +870,13 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
                 grounding = rag_helpers.summarize_context(
                     transcript, hits, self.rag_embedding_model, max_sentences=2, max_chars=200
                 )
+                fallback_elapsed = time.perf_counter() - t_fallback0
+                self._rag_turn_timing_stages["compression"] = (
+                    self._rag_turn_timing_stages.get("compression", 0.0) + fallback_elapsed
+                )
                 self.conv_logger.compressor_call(
                     transcript, [h.get("text", "") for h in hits[:2]], grounding,
-                    time.perf_counter() - t_fallback0, used_fallback=True,
+                    fallback_elapsed, used_fallback=True,
                 )
                 if grounding:
                     self.conv_logger.narrate_summary(my_epoch, hits_source, len(hits), grounding, used_fallback=True)
@@ -877,6 +919,21 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
                 self._rag_pending_ref_token_counts = (len(fallback_tokens), self.max_ref_tokens)
                 self.rag_pending_ref_tokens = fallback_tokens
 
+    def _rag_log_timing_summary(self) -> None:
+        """Print the consolidated big-to-small timing breakdown for the turn
+        that was just committed (real ref or fallback -- both call this).
+        Never raises: a missing/stale timing dict must not break injection."""
+        try:
+            start = getattr(self, "_rag_turn_timing_start", None)
+            stages = getattr(self, "_rag_turn_timing_stages", None)
+            if start is None or not stages:
+                return
+            total = time.perf_counter() - start
+            self.conv_logger.rag_timing_summary(self.rag_turn_epoch, total, dict(stages))
+            self.conv_logger.narrate_timing_summary(self.rag_turn_epoch, total, dict(stages))
+        except Exception:
+            pass
+
     def _rag_consume_pending_ref(self) -> None:
         """Called once per chunk while awaiting a background retrieval result.
         Injects the <ref> block as soon as it's ready, or a fallback <ref>
@@ -899,11 +956,13 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
             t0 = time.perf_counter()
             self._rag_inject_tokens(ref_tokens)
             elapsed = time.perf_counter() - t0
+            self._rag_turn_timing_stages["ref_inject"] = elapsed
             self.conv_logger.ref_injected(self.tokenizer.decode(ref_tokens), len(ref_tokens), elapsed, kind="ref")
             n_before, max_tok = self._rag_pending_ref_token_counts
             self.conv_logger.narrate_injection(
                 self.rag_turn_epoch, self.tokenizer.decode(ref_tokens), len(ref_tokens), n_before, max_tok, kind="ref"
             )
+            self._rag_log_timing_summary()
             print(
                 f"[liveTryPlasticity][RAG] <ref> injected ({len(ref_tokens)} tok) "
                 f"after {self.rag_filler_frame_count} filler chunks",
@@ -920,10 +979,13 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
             )
             t0 = time.perf_counter()
             self._rag_inject_tokens(fallback)
-            self.conv_logger.ref_injected(fallback_text, len(fallback), time.perf_counter() - t0, kind="ref_fallback")
+            fallback_inject_elapsed = time.perf_counter() - t0
+            self._rag_turn_timing_stages["ref_inject"] = fallback_inject_elapsed
+            self.conv_logger.ref_injected(fallback_text, len(fallback), fallback_inject_elapsed, kind="ref_fallback")
             self.conv_logger.narrate_injection(
                 self.rag_turn_epoch, fallback_text, len(fallback), len(fallback), self.max_ref_tokens, kind="ref_fallback"
             )
+            self._rag_log_timing_summary()
             print("[liveTryPlasticity][RAG] <ref> fallback injected after filler timeout", flush=True)
 
     @torch.no_grad()

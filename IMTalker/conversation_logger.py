@@ -56,8 +56,15 @@ class ConversationLogger:
         self.logger.setLevel(logging.INFO)
         self.logger.propagate = False
         if not self.logger.handlers:
+            # Millisecond-precision, time-only timestamps (HH:mm:ss.SSS) --
+            # requested explicitly so per-stage timing events (retrieval, web
+            # search, compression, ...) can be correlated to the millisecond;
+            # second-precision made it impossible to tell how much of a
+            # multi-event burst each individual stage actually took.
             console = logging.StreamHandler(sys.stdout)
-            console.setFormatter(logging.Formatter("[%(asctime)s] [CONV] %(message)s", datefmt="%H:%M:%S"))
+            console.setFormatter(
+                logging.Formatter("[%(asctime)s.%(msecs)03d] [CONV] %(message)s", datefmt="%H:%M:%S")
+            )
             self.logger.addHandler(console)
 
             if self.log_dir:
@@ -65,7 +72,7 @@ class ConversationLogger:
                 text_path = os.path.join(self.log_dir, f"conversation_{self.session_id}.log")
                 file_handler = logging.FileHandler(text_path, encoding="utf-8")
                 file_handler.setFormatter(
-                    logging.Formatter("[%(asctime)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+                    logging.Formatter("[%(asctime)s.%(msecs)03d] %(message)s", datefmt="%H:%M:%S")
                 )
                 self.logger.addHandler(file_handler)
                 self._jsonl_path = os.path.join(self.log_dir, f"conversation_{self.session_id}.jsonl")
@@ -113,12 +120,20 @@ class ConversationLogger:
         self.logger.info(line)
         self._write_jsonl({"kind": kind, "summary": summary, **fields})
 
+    @staticmethod
+    def _now_ts() -> str:
+        """HH:mm:ss.SSS, millisecond precision -- needed to tell how long each
+        individual pipeline stage actually took when several events land
+        within the same second."""
+        now = time.time()
+        return time.strftime("%H:%M:%S", time.localtime(now)) + f".{int(now % 1 * 1000):03d}"
+
     def _write_detail(self, turn_id: Any, heading: str, body: list[str]) -> None:
         """Append one readable, timestamped section to the detailed
         narrative log. Never raises -- logging must never break the pipeline."""
         if not self._detail_path:
             return
-        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        ts = self._now_ts()
         turn_label = f"Turn #{turn_id}" if turn_id is not None else "—"
         lines = [f"[{ts}] {turn_label} — {heading}"]
         for b in body:
@@ -143,6 +158,37 @@ class ConversationLogger:
             "rag_gate",
             f"triggered={triggered}",
             transcript=transcript, top_score=round(top_score, 4), lexical_hit=lexical_hit,
+        )
+
+    def quick_gate_timing(self, elapsed_s: float) -> None:
+        """The FAISS embed+search done synchronously on the GPU thread to
+        decide whether a turn is worth a full retrieval at all -- timed
+        separately from the (much larger) retrieval/compression stages below
+        it, so a slow embedding model can be told apart from a slow LLM call."""
+        self.event("quick_gate", f"elapsed={elapsed_s:.3f}s")
+
+    def rag_timing_summary(
+        self, turn_id: Any, total_s: float, stages: dict[str, float]
+    ) -> None:
+        """One consolidated, big-to-small breakdown of every timed stage in
+        this turn's pipeline, so the single slowest stage is visible without
+        having to manually sum up the individual per-stage lines above it."""
+        ordered = sorted(stages.items(), key=lambda kv: kv[1], reverse=True)
+        breakdown = " ".join(f"{name}={secs:.3f}s" for name, secs in ordered)
+        self.event(
+            "rag_timing_summary", f"turn={turn_id} total={total_s:.3f}s {breakdown}",
+            turn=turn_id, total_s=round(total_s, 3),
+            **{f"{name}_s": round(secs, 3) for name, secs in stages.items()},
+        )
+
+    def no_response_warning(self, turn_id: Any, transcript: str, elapsed_s: float) -> None:
+        """The pipeline reached the next user utterance without the model
+        having produced ANY spoken text for the previous turn -- previously
+        this just left a silent gap in the log with no trace at all."""
+        self.event(
+            "no_response_warning",
+            f"turn={turn_id} produced no spoken response after {elapsed_s:.1f}s",
+            turn=turn_id, transcript=transcript, elapsed_s=round(elapsed_s, 1),
         )
 
     def retrieval(self, transcript: str, source: str, hits: list[dict], elapsed_s: float) -> None:
@@ -325,6 +371,33 @@ class ConversationLogger:
                 turn_id, "Assistant replied",
                 [f'In reply to: "{transcript}"', "(no speech was captured for this turn)"],
             )
+
+    def narrate_timing_summary(self, turn_id: Any, total_s: float, stages: dict[str, float]) -> None:
+        ordered = sorted(stages.items(), key=lambda kv: kv[1], reverse=True)
+        lines = [f"Total time from question to information ready: {total_s:.2f} seconds. Breakdown, slowest first:"]
+        labels = {
+            "quick_gate": "quick document check",
+            "lookup_inject": "acknowledgement given to the assistant",
+            "local_retrieval": "local document search",
+            "web_search": "online search",
+            "compression": "turning search results into a summary",
+            "ref_inject": "giving the summary to the assistant",
+        }
+        for name, secs in ordered:
+            pct = (secs / total_s * 100.0) if total_s > 0 else 0.0
+            lines.append(f"  - {labels.get(name, name)}: {secs:.2f}s ({pct:.0f}% of the total)")
+        self._write_detail(turn_id, "Timing breakdown", lines)
+
+    def narrate_no_response_warning(self, turn_id: Any, transcript: str, elapsed_s: float) -> None:
+        self._write_detail(
+            turn_id, "No response detected",
+            [
+                f'In reply to: "{transcript}"',
+                f"The assistant did not produce any spoken words in the {elapsed_s:.1f} seconds "
+                "before the user spoke again. This is not normal -- some part of the pipeline "
+                "produced nothing to say.",
+            ],
+        )
 
     def narrate_thinking_start(self, turn_id: Any) -> None:
         self._write_detail(
