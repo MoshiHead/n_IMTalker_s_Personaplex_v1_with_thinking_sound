@@ -501,6 +501,16 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         self.rag_turn_epoch = 0
         self.rag_ref_committed_this_turn = False
         self.rag_awaiting_ref = False
+        # Set True if an uncaught exception ever escapes the per-chunk RAG/STT
+        # hook in _step() (see try/except around _rag_stt_step /
+        # _rag_consume_pending_ref below). Before that guard existed, such an
+        # exception propagated out of _step() and killed the whole GPU
+        # producer thread silently -- confirmed by conversation_logs_4, whose
+        # log ends mid-turn with no error line and no further component_status
+        # entries (the thread died with nothing left to log to). Once set,
+        # RAG is skipped for the rest of THIS session but the underlying
+        # avatar conversation keeps working.
+        self.rag_hard_disabled = False
         self.rag_pending_ref_tokens: list | None = None
         self._rag_pending_ref_token_counts = (0, 0)
         self.rag_filler_frame_count = 0
@@ -878,11 +888,46 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         # -- RAG: STT/VAD forward pass + turn-boundary detection, then
         # consume/timeout any in-flight background retrieval. No-op (both
         # guards false) unless --stt_hf_repo and --rag_index_dir were both
-        # configured at launch, so the non-RAG path is untouched. --
-        if self.stt_lm_gen is not None:
-            self._rag_stt_step(chunk)
-        if self.rag_awaiting_ref:
-            self._rag_consume_pending_ref()
+        # configured at launch, so the non-RAG path is untouched.
+        #
+        # Both calls run inside try/except: this hook runs on every single
+        # chunk of the live conversation, so an uncaught exception here would
+        # otherwise propagate out of _step() and kill the entire GPU producer
+        # thread -- audio and video generation stop forever, with nothing
+        # captured in either conversation log. That failure signature (log
+        # ends mid-turn, no error line, no further component_status entries)
+        # matches what conversation_logs_4 shows, though the exact exception
+        # was never captured there, so this is a closed gap, not a proven
+        # root cause. On failure, RAG is disabled for the rest of this
+        # session but the avatar keeps talking. --
+        if self.stt_lm_gen is not None and not self.rag_hard_disabled:
+            try:
+                self._rag_stt_step(chunk)
+            except Exception as e:
+                tb = traceback.format_exc()
+                print(
+                    f"[liveTryPlasticity][RAG] _rag_stt_step failed, disabling RAG "
+                    f"for the rest of this session: {e!r}\n{tb}",
+                    flush=True,
+                )
+                self.conv_logger.error("rag_stt_step", e, tb)
+                self.rag_hard_disabled = True
+                self.rag_awaiting_ref = False
+                self.rag_thinking_active = False
+        if self.rag_awaiting_ref and not self.rag_hard_disabled:
+            try:
+                self._rag_consume_pending_ref()
+            except Exception as e:
+                tb = traceback.format_exc()
+                print(
+                    f"[liveTryPlasticity][RAG] _rag_consume_pending_ref failed, disabling "
+                    f"RAG for the rest of this session: {e!r}\n{tb}",
+                    flush=True,
+                )
+                self.conv_logger.error("rag_consume_pending_ref", e, tb)
+                self.rag_hard_disabled = True
+                self.rag_awaiting_ref = False
+                self.rag_thinking_active = False
 
         t_lm0 = time.perf_counter()
         lm_out = self.lm_gen._step(codes[:, :, :1])
@@ -3249,7 +3294,39 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                             flush=True,
                         )
 
-            gpu_thread = threading.Thread(target=_gpu_producer_thread, daemon=True, name="gpu-producer")
+            def _gpu_producer_thread_safe() -> None:
+                """Defense-in-depth guard around the whole GPU producer loop.
+                Without this, an uncaught exception ANYWHERE in that loop
+                (Moshi step, Helium hidden capture, FM motion sampling,
+                render/encode -- none of which have their own try/except)
+                kills only this one daemon thread: audio/video generation
+                stops forever, the websocket stays open, and neither
+                conversation log records anything, so the session just hangs
+                with the user hearing nothing -- the same failure signature
+                seen in conversation_logs_4 (log ends mid-turn, no error
+                line, no further component_status entries), though the exact
+                exception was never captured there, so this closes a
+                confirmed gap rather than a proven root cause. This wrapper
+                makes any future occurrence diagnosable (full traceback goes
+                to the conversation log) and ends the session cleanly instead
+                of hanging indefinitely."""
+                try:
+                    _gpu_producer_thread()
+                except Exception as e:
+                    tb = traceback.format_exc()
+                    print(
+                        f"[GPU] FATAL uncaught exception in producer thread: {e!r}\n{tb}",
+                        flush=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        reply_engine.conv_logger.error("gpu_producer_thread", e, tb)
+                    for q in (frame_q, audio_q):
+                        if q is None:
+                            continue
+                        with contextlib.suppress(Exception):
+                            asyncio.run_coroutine_threadsafe(q.put(None), event_loop).result(timeout=30.0)
+
+            gpu_thread = threading.Thread(target=_gpu_producer_thread_safe, daemon=True, name="gpu-producer")
             gpu_thread.start()
             print(
                 f"[AJ][AUDIO] session={session_id[:8]} "
