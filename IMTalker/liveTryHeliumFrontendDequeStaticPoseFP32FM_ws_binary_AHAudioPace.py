@@ -192,9 +192,28 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
     replay enabled. We do not use Python forward hooks in this path.
     """
 
-    def __init__(self, *args, capture_layer: int = -2, thinking_sound_path: str = "", **kwargs) -> None:
+    def __init__(
+        self,
+        *args,
+        capture_layer: int = -2,
+        thinking_sound_path: str = "",
+        rag_max_filler_sec: float = 6.0,
+        **kwargs,
+    ) -> None:
         self.tf_capture_layer = int(capture_layer)
         super().__init__(*args, **kwargs)
+
+        # Forensic finding (conversation_logs_1/2/3): the old fixed 25-chunk
+        # (~2.0s) filler cap was shorter than observed real-world retrieval+
+        # compression latency -- local-only compression alone was observed
+        # taking ~2.5-2.7s, and web-search-augmented turns 2.4-3.7s end to
+        # end, so the cap fired first in 5/5 logged RAG-triggered turns and
+        # discarded a correctly-computed answer every time. Overriding the
+        # class-level default (see _RAG_MAX_FILLER_FRAMES below) here with an
+        # instance attribute computed from a CLI-configurable seconds value
+        # (default 6.0s: comfortably above the worst observed combined
+        # latency of ~3.7s, including margin for GPU-contention slowdown).
+        self._RAG_MAX_FILLER_FRAMES = max(1, round(float(rag_max_filler_sec) * TARGET_SR / MIMI_FRAME_SIZE))
 
         # RAG "thinking sound": played in place of the model's own audio while
         # a RAG/web search retrieval is in flight (see _rag_start_turn /
@@ -465,6 +484,10 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
     # -- RAG turn-detection constants (frame = one MIMI_FRAME_SIZE / 80ms chunk,
     # same granularity as _step() itself) --
     _RAG_VAD_SILENCE_FRAMES_REQUIRED = 12   # ~960ms of silence ends an utterance
+    # Class-level fallback only -- __init__ always overrides this with an
+    # instance attribute derived from the --rag_max_filler_sec CLI flag (see
+    # __init__ below). Kept here so the attribute still exists with a sane
+    # value for any code path that might reference it before __init__ runs.
     _RAG_MAX_FILLER_FRAMES = 25             # ~2s filler cap before a fallback <ref>
 
     def reset_session(self) -> None:
@@ -585,10 +608,15 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
                 break
 
         QUICK_GATE_MARGIN = 0.03
-        triggered = not (top_score < (self.rag_min_score - QUICK_GATE_MARGIN) and not lexical_hit)
+        effective_gate_threshold = self.rag_min_score - QUICK_GATE_MARGIN
+        triggered = not (top_score < effective_gate_threshold and not lexical_hit)
         self.conv_logger.rag_gate(transcript, top_score, lexical_hit, triggered)
+        # Pass the actual effective comparison value (rag_min_score minus the
+        # quick-gate margin), not the raw rag_min_score tuning knob -- the
+        # narration previously displayed 0.250 while the real comparison used
+        # 0.220, which didn't match the decisions actually being made.
         self.conv_logger.narrate_decision(
-            self.rag_turn_epoch + 1, top_score, self.rag_min_score, lexical_hit, triggered
+            self.rag_turn_epoch + 1, top_score, effective_gate_threshold, lexical_hit, triggered
         )
         if not triggered:
             print(f"[liveTryPlasticity][RAG] casual turn (top={top_score:.3f}) -- no <ref>", flush=True)
@@ -664,8 +692,14 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
                     f"{top_score:.3f}, below the {self.web_search_trigger_below:.3f} needed "
                     f"to trust it), so the assistant is also checking the web"
                 )
-                self.conv_logger.narrate_web_search_start(
-                    my_epoch, transcript, self.web_search_provider, web_reason
+                # Logged at dispatch time (not just on completion below) so
+                # conversation_<session>.log's own event order matches real
+                # chronology -- previously this only appeared after the call
+                # finished, which could make a fast-but-later fallback injection
+                # look like it preceded a web search that actually started earlier.
+                self.conv_logger.event(
+                    "web_search_start", query=transcript, provider=self.web_search_provider,
+                    triggered_reason=web_reason,
                 )
                 t_web0 = time.perf_counter()
                 web_hits = rag_helpers.web_search_query_sync(
@@ -677,8 +711,14 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
                     transcript, self.web_search_provider, len(web_hits), web_elapsed,
                     triggered_reason=f"local top_score={top_score:.3f} < trigger={self.web_search_trigger_below}",
                 )
-                if web_hits:
-                    sorted_web_hits = sorted(web_hits, key=lambda c: c["similarity_score"], reverse=True)
+                # Forensic finding (conversation_logs_2/3): web results carried
+                # no relevance floor at all -- scores as low as 0.04 (clearly
+                # unrelated pages) were still summarized/injected as if they
+                # were usable context. Local retrieval already has this floor
+                # (min_score=self.rag_min_score); apply the same discipline here.
+                relevant_web_hits = [h for h in web_hits if h.get("similarity_score", 0.0) >= self.web_search_min_score]
+                if relevant_web_hits:
+                    sorted_web_hits = sorted(relevant_web_hits, key=lambda c: c["similarity_score"], reverse=True)
                     hits = sorted_web_hits[: self.web_search_max_results]
                     self.conv_logger.retrieval(transcript, "web", hits, web_elapsed)
                     self.conv_logger.narrate_web_search_results(
@@ -686,18 +726,36 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
                     )
                     hits_source = "a web search"
                 else:
+                    # Matches the pre-existing behavior when web search itself
+                    # returns nothing: `hits` is left as-is (the original local
+                    # hits, even though they were below the web-search trigger)
+                    # rather than being cleared to empty -- a real, if weaker,
+                    # local match is still better than manufacturing a "no
+                    # information" outcome when the web search simply had
+                    # nothing relevant to add.
                     self.conv_logger.narrate_web_search_results(my_epoch, [], [], self.web_search_max_results)
+                    if web_hits and not relevant_web_hits:
+                        print(
+                            f"[liveTryPlasticity][RAG] all {len(web_hits)} web result(s) scored below "
+                            f"web_search_min_score={self.web_search_min_score} -- discarding web results, "
+                            f"falling back to local documents instead",
+                            flush=True,
+                        )
 
-            if my_epoch != self.rag_turn_epoch:
-                return  # superseded by a newer turn (e.g. barge-in)
+            if my_epoch != self.rag_turn_epoch or self.rag_ref_committed_this_turn:
+                # Superseded by a newer turn, or the filler timeout already
+                # committed a fallback while we were retrieving/searching --
+                # skip compression entirely rather than spending GPU time on
+                # a result that can never be used (previously this ran
+                # unconditionally and was observed discarding a fully-computed
+                # answer in every logged RAG turn).
+                return
 
             grounding = ""
             used_fallback = False
             t_compress0 = time.perf_counter()
             if hits and self.context_compressor is not None:
-                grounding = self.context_compressor.compress(
-                    question=transcript, history=self.rag_session_history[-1:], chunks=hits,
-                )
+                grounding = self.context_compressor.compress(question=transcript, chunks=hits)
                 self.conv_logger.compressor_call(
                     transcript, [h.get("text", "") for h in hits[:2]], grounding,
                     time.perf_counter() - t_compress0, used_fallback=False,
@@ -758,8 +816,9 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
     def _rag_consume_pending_ref(self) -> None:
         """Called once per chunk while awaiting a background retrieval result.
         Injects the <ref> block as soon as it's ready, or a fallback <ref>
-        after _RAG_MAX_FILLER_FRAMES chunks (~2s) so the model never hangs
-        waiting on a slow/failed retrieval."""
+        after self._RAG_MAX_FILLER_FRAMES chunks (--rag_max_filler_sec,
+        default 6.0s) so the model never hangs waiting on a slow/failed
+        retrieval."""
         import rag_helpers
 
         self.rag_filler_frame_count += 1
@@ -2289,6 +2348,21 @@ class LiveHeliumFMOptions(BaseOptions):
         parser.add_argument("--rag_min_score", type=float, default=0.25)
         parser.add_argument("--rag_trigger_score", type=float, default=0.30, help="Only fire retrieval+injection if the top hit clears this bar")
         parser.add_argument("--max_ref_tokens", type=int, default=250, help="Cap on injected <ref> block length, in tokens")
+        parser.add_argument(
+            "--rag_max_filler_sec", type=float, default=6.0,
+            help="Max seconds to wait for RAG retrieval+compression before giving up and injecting a "
+                 "generic 'no information' fallback instead. Forensic logs (conversation_logs_1/2/3) "
+                 "showed real retrieval+compression regularly taking 2.5-3.7s end to end, so the old "
+                 "fixed ~2.0s cap discarded a correctly-computed answer in every observed RAG turn; "
+                 "6.0s leaves comfortable margin above the worst latency actually measured.",
+        )
+        parser.add_argument(
+            "--web_search_min_score", type=float, default=0.15,
+            help="Discard web-search results scoring below this relevance floor before summarizing/"
+                 "injecting them. Forensic logs showed clearly-irrelevant web results scoring 0.04-0.13 "
+                 "(e.g. unrelated news for an unrelated query) versus clearly-relevant ones scoring "
+                 "0.37+ -- this floor sits in the gap between those two clusters.",
+        )
         parser.add_argument("--stt_hf_repo", default="", help="HF repo for the STT/VAD submodel, e.g. kyutai/stt-1b-en_fr-candle. Omit to disable RAG (no turn-detection signal).")
         parser.add_argument("--stt_pkg_dir", default="", help="Dir containing an isolated `pip install --no-deps --target <dir> moshi` install of the upstream Kyutai moshi package")
         parser.add_argument("--vad_threshold", type=float, default=0.5)
@@ -2460,8 +2534,10 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                 web_search_max_results=int(getattr(args, "web_search_max_results", 3)),
                 web_search_trigger_below=float(getattr(args, "web_search_trigger_below", 0.45)),
                 web_search_timeout=float(getattr(args, "web_search_timeout", 3.0)),
+                web_search_min_score=float(getattr(args, "web_search_min_score", 0.15)),
                 conversation_log_dir=getattr(args, "conversation_log_dir", ""),
                 thinking_sound_path=getattr(args, "thinking_sound_path", ""),
+                rag_max_filler_sec=float(getattr(args, "rag_max_filler_sec", 6.0)),
             )
         return moshi_engine
 

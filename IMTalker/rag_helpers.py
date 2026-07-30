@@ -310,7 +310,15 @@ class ContextCompressor:
         n_params = sum(p.numel() for p in self.model.parameters()) / 1e9
         print(f"[rag_helpers][compressor] ready — {n_params:.2f}B params", flush=True)
 
-    def compress(self, question: str, history: list[tuple[str, str]], chunks: list[dict]) -> str:
+    def compress(self, question: str, chunks: list[dict]) -> str:
+        # NOTE: this used to also accept a `history` parameter (recent
+        # conversation turns), but it was never referenced anywhere in the
+        # prompt below -- confirmed by forensic review of conversation_logs_1
+        # (Issue #5). Removed rather than wired up, since using it would be a
+        # behavior change (untested prompt content) beyond fixing the
+        # confirmed problem (a parameter that implied functionality it didn't
+        # have). If conversation-aware compression is wanted later, that's a
+        # separate, deliberately-designed feature, not a bugfix.
         if not chunks:
             return ""
         passages = "\n".join(

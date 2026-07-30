@@ -114,6 +114,7 @@ class MoshiOnlyEngine:
         web_search_max_results: int = 3,
         web_search_trigger_below: float = 0.45,
         web_search_timeout: float = 3.0,
+        web_search_min_score: float = 0.15,
         conversation_log_dir: str = "",
     ) -> None:
         from conversation_logger import ConversationLogger  # IMTalker/ is on sys.path by the time this runs
@@ -232,6 +233,7 @@ class MoshiOnlyEngine:
         self.web_search_max_results = int(web_search_max_results)
         self.web_search_trigger_below = float(web_search_trigger_below)
         self.web_search_timeout = float(web_search_timeout)
+        self.web_search_min_score = float(web_search_min_score)
         if self.web_search_enabled and not self.web_search_api_key:
             print(
                 "[liveTry] web_search_enabled but no web_search_api_key configured "

@@ -100,11 +100,22 @@ if [[ "$ENABLE_RAG" == "1" ]]; then
     --compressor_model "${COMPRESSOR_MODEL:-Qwen/Qwen2.5-1.5B-Instruct}"
     --compressor_device "${COMPRESSOR_DEVICE:-cuda}"
     --thinking_sound_path "$THINKING_SOUND_PATH"
+    # Forensic fix (conversation_logs_1/2/3): real retrieval+compression was
+    # observed regularly taking 2.5-3.7s end to end, so the old fixed ~2.0s
+    # filler cap discarded a correctly-computed answer in every logged RAG
+    # turn. Default raised to 6.0s with comfortable margin; override here if
+    # your corpus/compressor/network profile needs something different.
+    --rag_max_filler_sec "${RAG_MAX_FILLER_SEC:-6.0}"
+    # Forensic fix: web results had no relevance floor at all (scores as low
+    # as 0.04 for clearly-unrelated pages were still used). Local retrieval
+    # already floors at rag_min_score; this applies the same discipline to
+    # web results.
+    --web_search_min_score "${WEB_SEARCH_MIN_SCORE:-0.15}"
   )
   if [[ "${WEB_SEARCH_ENABLED:-0}" == "1" ]]; then
     RAG_ARGS+=(--web_search_enabled --web_search_api_key "${WEB_SEARCH_API_KEY:?set WEB_SEARCH_API_KEY when WEB_SEARCH_ENABLED=1}")
   fi
-  echo "RAG enabled: checkpoint=$RAG_CHECKPOINT_DIR index=$RAG_INDEX_DIR stt_pkg=$STT_PKG_DIR web_search=${WEB_SEARCH_ENABLED:-0} conversation_log_dir=$CONVERSATION_LOG_DIR thinking_sound=$THINKING_SOUND_PATH"
+  echo "RAG enabled: checkpoint=$RAG_CHECKPOINT_DIR index=$RAG_INDEX_DIR stt_pkg=$STT_PKG_DIR web_search=${WEB_SEARCH_ENABLED:-0} conversation_log_dir=$CONVERSATION_LOG_DIR thinking_sound=$THINKING_SOUND_PATH rag_max_filler_sec=${RAG_MAX_FILLER_SEC:-6.0} web_search_min_score=${WEB_SEARCH_MIN_SCORE:-0.15}"
 else
   RAG_ARGS=()
 fi
