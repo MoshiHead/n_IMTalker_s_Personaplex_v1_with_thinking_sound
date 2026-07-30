@@ -187,6 +187,80 @@ def decode_stt_tokens(text_tokens: list[torch.Tensor], tokenizer, padding_token_
 
 # ── Web search (Tavily / Serper / Bing) ──────────────────────────────────────
 
+# Search providers return raw scraped page text, which is full of things that
+# are meaningless when read aloud: markdown headings/tables, image alt-text,
+# chart-range buttons ("1D 5D 1M 6M 1Y 5Y"), and marketing boilerplate. Left
+# in, this junk reaches the assistant's grounding context verbatim -- confirmed
+# in conversation_logs_5, where a gold-price answer was grounded on
+# "...back it up with a 120% Best Price Guarantee. Image 13: Dollar
+# IconCalculate Gold ValueImage 14: Bell" and the spoken reply became a sales
+# pitch for a Seattle gold dealer instead of the price. These patterns strip
+# that layer off before the text is scored, compressed, or injected.
+_WEB_IMAGE_ALT_RE = re.compile(r"Image\s+\d+\s*:\s*[^\n]*?(?=(?:Image\s+\d+\s*:)|\n|$)")
+_WEB_MD_SEPARATOR_RE = re.compile(r"^[\s|:-]*-{2,}[\s|:-]*$")
+_WEB_MD_HEADING_RE = re.compile(r"^\s*#{1,6}\s*", re.MULTILINE)
+_WEB_MD_LINK_RE = re.compile(r"\[([^\]]*)\]\([^)]*\)")
+_WEB_CHART_RANGE_RE = re.compile(r"^\s*(?:\d+[DWMY]|YTD|MAX)\s*$", re.MULTILINE | re.IGNORECASE)
+_WEB_BLANKS_RE = re.compile(r"\n{2,}")
+_WEB_SPACES_RE = re.compile(r"[ \t]{2,}")
+
+
+def _flatten_md_table_row(line: str) -> str:
+    """Turn '| Gold Price per Ounce | $4,059.41 | £3,041.42 |' into
+    'Gold Price per Ounce: $4,059.41, £3,041.42.' -- price/quote pages put the
+    answer inside markdown tables, so deleting table rows outright (as an
+    earlier version of this cleaner did) threw away the very number the user
+    asked for."""
+    cells = [c.strip() for c in line.strip().strip("|").split("|")]
+    cells = [c for c in cells if c]
+    if not cells:
+        return ""
+    if len(cells) == 1:
+        return cells[0]
+    return f"{cells[0]}: " + ", ".join(cells[1:])
+
+
+def clean_web_text(text: str, max_chars: int = 1000) -> str:
+    """Strip scraped-page furniture from a web search snippet, keeping the
+    prose -- and the numbers -- that actually answer questions. Conservative
+    by design: it rewrites or removes known-junk structures rather than trying
+    to detect 'good' sentences, and returns the original text if cleaning
+    would leave almost nothing."""
+    if not text:
+        return ""
+    original = text
+    text = _WEB_MD_LINK_RE.sub(r"\1", text)
+    text = _WEB_IMAGE_ALT_RE.sub(" ", text)
+    text = _WEB_MD_HEADING_RE.sub("", text)
+    text = _WEB_CHART_RANGE_RE.sub("", text)
+    text = _WEB_BLANKS_RE.sub("\n", text)
+    text = _WEB_SPACES_RE.sub(" ", text)
+    # Collapse the remaining newlines into sentence-ish separators so the
+    # downstream sentence splitter and the compressor prompt both see one
+    # continuous piece of prose instead of a column of fragments.
+    kept = []
+    for ln in (ln.strip() for ln in text.split("\n")):
+        if not ln or _WEB_MD_SEPARATOR_RE.match(ln):
+            continue
+        if ln.startswith("|"):
+            ln = _flatten_md_table_row(ln)
+            if not ln:
+                continue
+        # Keep anything carrying letters or digits; drop leftover punctuation-
+        # only fragments such as a stray "(" or ")". Digits alone must qualify
+        # -- a bare "$298.29" line IS the answer on a stock-quote page.
+        if not any(ch.isalnum() for ch in ln):
+            continue
+        kept.append(ln if ln.endswith((".", "!", "?", ":", ",")) else ln + ".")
+    cleaned = " ".join(kept).strip()
+    cleaned = _WEB_SPACES_RE.sub(" ", cleaned)
+    if len(cleaned) < 40 and len(original.strip()) >= 40:
+        # Cleaning removed essentially everything (heavily-structured page);
+        # fall back to the raw text rather than discarding a real result.
+        return original.strip()[:max_chars]
+    return cleaned[:max_chars]
+
+
 async def web_search_query(
     query: str,
     api_key: Optional[str],
@@ -212,7 +286,8 @@ async def web_search_query(
                     data = await resp.json()
                 raw_results = data.get("results", [])[:max_results]
                 return [
-                    {"id": f"web-{i}", "source": r.get("url", "web"), "text": r.get("content", "")[:1000],
+                    {"id": f"web-{i}", "source": r.get("url", "web"),
+                     "text": clean_web_text(r.get("content", "")),
                      "similarity_score": float(r.get("score", 0.5))}
                     for i, r in enumerate(raw_results)
                 ]
@@ -226,7 +301,8 @@ async def web_search_query(
                     data = await resp.json()
                 raw_results = data.get("organic", [])[:max_results]
                 return [
-                    {"id": f"web-{i}", "source": r.get("link", "web"), "text": r.get("snippet", "")[:1000],
+                    {"id": f"web-{i}", "source": r.get("link", "web"),
+                     "text": clean_web_text(r.get("snippet", "")),
                      "similarity_score": max(0.5, 0.9 - 0.05 * i)}
                     for i, r in enumerate(raw_results)
                 ]
@@ -240,7 +316,8 @@ async def web_search_query(
                     data = await resp.json()
                 raw_results = data.get("webPages", {}).get("value", [])[:max_results]
                 return [
-                    {"id": f"web-{i}", "source": r.get("url", "web"), "text": r.get("snippet", "")[:1000],
+                    {"id": f"web-{i}", "source": r.get("url", "web"),
+                     "text": clean_web_text(r.get("snippet", "")),
                      "similarity_score": max(0.5, 0.9 - 0.05 * i)}
                     for i, r in enumerate(raw_results)
                 ]
@@ -313,8 +390,17 @@ class ContextCompressor:
                 new_len = input_ids.shape[1] - self.prompt_len
                 if new_len < self.min_new:
                     return False
-                tail = self.tokenizer.decode(input_ids[0, -3:])
-                return tail.rstrip().endswith((".", "!", "?", "\n"))
+                tail = self.tokenizer.decode(input_ids[0, -3:]).rstrip()
+                if not tail.endswith((".", "!", "?", "\n")):
+                    return False
+                # A '.' between digits is a decimal point, not a sentence end.
+                # Without this check, generation stopped inside prices --
+                # confirmed in conversation_logs_4, where the gold price
+                # $4,068.60 was cut to "$4,068." before the cents were
+                # generated.
+                if re.search(r"\d[.,]\d*$", tail):
+                    return False
+                return True
 
         self._StoppingCriteriaList = StoppingCriteriaList
         self._SentenceEndCriteria = _SentenceEndCriteria
@@ -332,12 +418,27 @@ class ContextCompressor:
         # separate, deliberately-designed feature, not a bugfix.
         if not chunks:
             return ""
+        # 320 chars, not 180: the old limit routinely cut the passage off
+        # before the sentence carrying the actual figure. `max_passages` is
+        # now honored as configured -- it was previously clamped by
+        # min(max_passages, 2), so raising the setting silently did nothing.
         passages = "\n".join(
-            f"[{i + 1}] {c['text'][:180]}" for i, c in enumerate(chunks[: min(self.max_passages, 2)])
+            f"[{i + 1}] {c['text'][:320]}" for i, c in enumerate(chunks[: self.max_passages])
         )
         user_content = (
-            "Answer in 1 short spoken sentence, plain text, no markdown, no lead-in. "
-            "If the passages don't answer the question, reply NO_CONTEXT.\n"
+            "You are given passages from a web page or document. Answer the question in "
+            "ONE short sentence that will be read aloud.\n"
+            "Rules:\n"
+            "- State the specific fact asked for (the number, price, date, or name) and "
+            "include its units or currency.\n"
+            "- Ignore advertising, slogans, menus, image captions, and any text about the "
+            "website or seller itself -- it is page furniture, not an answer.\n"
+            "- Plain text only: no markdown, no lead-in phrase, no citation markers.\n"
+            "- Never reply conversationally. You are writing a fact for someone else to say, "
+            "not talking to the user: never answer with \"Yes, I can...\", an offer to help, or "
+            "a comment about yourself. If the question is phrased as a yes/no request such as "
+            "\"can you tell me about X\", state the key fact about X instead.\n"
+            "- If the passages genuinely do not answer the question, reply exactly NO_CONTEXT.\n"
             f"Q: {question}\nPassages:\n{passages}\nA:"
         )
         messages = [{"role": "user", "content": user_content}]
@@ -359,7 +460,12 @@ class ContextCompressor:
         new_tokens = out[0, prompt_len:]
         result = self.tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
         result = _SYMBOL_RE.sub("", result).strip()
-        result = re.sub(r"^[\-•\d\.\)]+\s*", "", result)
+        # Strip a leading list marker ("1. ", "- ", "• ") only when it is
+        # followed by whitespace. The previous pattern (^[-•\d.)]+\s*) ate any
+        # leading digits, so an answer that opened with a bare number -- the
+        # normal shape of a price or stock-quote answer -- was silently
+        # mangled before it ever reached the caller.
+        result = re.sub(r"^\s*(?:[-•*]|\d{1,2}[.)])\s+", "", result)
         if "NO_CONTEXT" in result or not result:
             # Logged so a fallback-to-extractive-summary event (visible in
             # the conversation log as compressor fallback=True) can be traced

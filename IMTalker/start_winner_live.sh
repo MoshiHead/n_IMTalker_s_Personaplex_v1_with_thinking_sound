@@ -111,11 +111,16 @@ if [[ "$ENABLE_RAG" == "1" ]]; then
     # already floors at rag_min_score; this applies the same discipline to
     # web results.
     --web_search_min_score "${WEB_SEARCH_MIN_SCORE:-0.15}"
+    # Play the thinking sound on casual (non-RAG) turns too, so the user hears
+    # acknowledgement after every question rather than only before searches.
+    # It stops as soon as the model starts speaking. Set 0 to limit the sound
+    # to RAG/web-search turns.
+    --thinking_sound_casual "${THINKING_SOUND_CASUAL:-1}"
   )
   if [[ "${WEB_SEARCH_ENABLED:-0}" == "1" ]]; then
     RAG_ARGS+=(--web_search_enabled --web_search_api_key "${WEB_SEARCH_API_KEY:?set WEB_SEARCH_API_KEY when WEB_SEARCH_ENABLED=1}")
   fi
-  echo "RAG enabled: checkpoint=$RAG_CHECKPOINT_DIR index=$RAG_INDEX_DIR stt_pkg=$STT_PKG_DIR web_search=${WEB_SEARCH_ENABLED:-0} conversation_log_dir=$CONVERSATION_LOG_DIR thinking_sound=$THINKING_SOUND_PATH rag_max_filler_sec=${RAG_MAX_FILLER_SEC:-6.0} web_search_min_score=${WEB_SEARCH_MIN_SCORE:-0.15}"
+  echo "RAG enabled: checkpoint=$RAG_CHECKPOINT_DIR index=$RAG_INDEX_DIR stt_pkg=$STT_PKG_DIR web_search=${WEB_SEARCH_ENABLED:-0} conversation_log_dir=$CONVERSATION_LOG_DIR thinking_sound=$THINKING_SOUND_PATH rag_max_filler_sec=${RAG_MAX_FILLER_SEC:-6.0} web_search_min_score=${WEB_SEARCH_MIN_SCORE:-0.15} thinking_sound_casual=${THINKING_SOUND_CASUAL:-1}"
 else
   RAG_ARGS=()
 fi

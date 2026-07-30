@@ -198,9 +198,14 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         capture_layer: int = -2,
         thinking_sound_path: str = "",
         rag_max_filler_sec: float = 6.0,
+        thinking_sound_casual: bool = True,
         **kwargs,
     ) -> None:
         self.tf_capture_layer = int(capture_layer)
+        # Whether the thinking sound also covers casual (non-RAG) turns, where
+        # it fills the gap until the model starts speaking instead of covering
+        # a retrieval. Configurable because it is a subjective audio choice.
+        self.thinking_sound_casual = bool(thinking_sound_casual)
         super().__init__(*args, **kwargs)
 
         # Forensic finding (conversation_logs_1/2/3): the old fixed 25-chunk
@@ -489,6 +494,12 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
     # __init__ below). Kept here so the attribute still exists with a sane
     # value for any code path that might reference it before __init__ runs.
     _RAG_MAX_FILLER_FRAMES = 25             # ~2s filler cap before a fallback <ref>
+    # Casual-turn thinking sound: hard cap (~3s) in case the model never
+    # crosses the speech threshold, and the RMS level at which the model's own
+    # output counts as "it has started answering". The threshold mirrors the
+    # default --assistant_speech_rms_threshold used by the avatar gate.
+    _RAG_MAX_CASUAL_FILLER_FRAMES = 38
+    _CASUAL_SPEECH_RMS_THRESHOLD = 0.006
 
     def reset_session(self) -> None:
         super().reset_session()
@@ -516,12 +527,26 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         self.rag_filler_frame_count = 0
         self.rag_session_history: list[tuple[str, str]] = []
         self.rag_current_transcript = ""
-        # Snapshot of len(self.audio_text) at turn start, so the assistant's
-        # response for THIS turn can be recovered as audio_text[snapshot:]
-        # once the next user utterance starts (see _rag_stt_step).
+        # Snapshot of len(self.audio_text) at turn start (when the user STOPPED
+        # speaking), marking where this turn's assistant response begins.
         self._rag_turn_start_audio_text_len = 0
+        # Snapshot of len(self.audio_text) at the moment the user STARTS
+        # speaking the next utterance, marking where this turn's response
+        # ends. Both bounds are needed: the model is full-duplex and keeps
+        # emitting text while the user talks, so slicing to the end of
+        # audio_text (as this used to) pulled the NEXT turn's opening words
+        # into the previous turn's logged response. Confirmed in
+        # conversation_logs_5, where the gold-price turn's logged reply ended
+        # with "I' not sure how to test a Tesla" -- the start of the reply to
+        # the Tesla question the user asked next.
+        self._rag_utterance_start_audio_text_len = 0
         # "Thinking sound" playback state (see _next_thinking_sound_chunk / _step).
         self.rag_thinking_active = False
+        # Casual (non-RAG) turns play the thinking sound too, but there is no
+        # retrieval to wait on -- it just covers the gap until the model
+        # actually starts speaking (see _step).
+        self.rag_thinking_casual = False
+        self.rag_casual_filler_frame_count = 0
         self._thinking_sound_cursor = 0
         self._thinking_sound_started_at = 0.0
         self._thinking_sound_play_count = 0
@@ -555,6 +580,12 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
             self.stt_token_buffer.append(stt_tokens[:, :1, :].cpu())
             text_token = stt_tokens[0, 0, 0].item()
             if text_token not in (0, self.stt_padding_token_id):
+                if not self.stt_in_utterance:
+                    # First real word of a new user utterance: everything the
+                    # model emitted before this point belongs to the PREVIOUS
+                    # turn's response, everything after is it reacting to what
+                    # it is hearing now.
+                    self._rag_utterance_start_audio_text_len = len(self.audio_text)
                 self.stt_in_utterance = True
                 self.stt_last_vad_end = False
         if vad_score > self.vad_threshold:
@@ -578,7 +609,18 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
             if transcript.strip():
                 # Log the PREVIOUS turn's assistant response now that we know
                 # it's finished (the user has started speaking again).
-                prev_response = self.audio_text[self._rag_turn_start_audio_text_len:].strip()
+                # Slice between BOTH turn boundaries (see reset_session):
+                # from where the previous turn's answer began, to where this
+                # new utterance's first word arrived. Falls back to "rest of
+                # audio_text" only if the end bound was never set or looks
+                # stale, so a missing bound degrades to the old behavior
+                # rather than logging an empty response.
+                resp_end = self._rag_utterance_start_audio_text_len
+                if resp_end <= self._rag_turn_start_audio_text_len:
+                    resp_end = len(self.audio_text)
+                prev_response = self.audio_text[
+                    self._rag_turn_start_audio_text_len:resp_end
+                ].strip()
                 if prev_response:
                     self.conv_logger.assistant_response(self.rag_current_transcript, prev_response)
                     self.conv_logger.narrate_response(self.rag_turn_epoch, self.rag_current_transcript, prev_response)
@@ -635,6 +677,18 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
             self.rag_turn_epoch += 1
             self.rag_current_transcript = transcript
             self._rag_turn_start_audio_text_len = len(self.audio_text)
+            # Casual turns get the thinking sound too, so the user always
+            # hears acknowledgement rather than silence after speaking. There
+            # is nothing to retrieve here, so it stops as soon as the model
+            # starts talking (or after the hard cap) -- see _step.
+            if self.thinking_sound_casual and self.thinking_sound_pcm is not None:
+                self.rag_thinking_active = True
+                self.rag_thinking_casual = True
+                self.rag_casual_filler_frame_count = 0
+                self._thinking_sound_started_at = time.perf_counter()
+                self._thinking_sound_play_count = 1
+                self.conv_logger.event("thinking_sound_start", transcript=transcript, casual=True)
+                self.conv_logger.narrate_thinking_start(self.rag_turn_epoch)
             return
 
         self.rag_turn_epoch += 1
@@ -970,6 +1024,24 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         # _gpu_producer_thread) to stay visually idle rather than lip-syncing
         # to this non-speech sound (its real RMS is well above the speech
         # threshold, so without this the avatar would appear to "talk").
+        # Casual-turn thinking sound stops the moment the model's own output
+        # becomes speech (measured here, before the thinking sound replaces
+        # it below) so the reply is never clipped or delayed.
+        if self.rag_thinking_casual and self.rag_thinking_active:
+            model_rms = float(np.sqrt(np.mean(np.square(reply_pcm, dtype=np.float32))))
+            self.rag_casual_filler_frame_count += 1
+            if model_rms > self._CASUAL_SPEECH_RMS_THRESHOLD:
+                self._stop_thinking_sound(
+                    self.rag_turn_epoch, "model_speaking", "the assistant started answering"
+                )
+                self.rag_thinking_casual = False
+            elif self.rag_casual_filler_frame_count >= self._RAG_MAX_CASUAL_FILLER_FRAMES:
+                self._stop_thinking_sound(
+                    self.rag_turn_epoch, "casual_timeout",
+                    "the assistant had not started speaking yet, so the sound was stopped",
+                )
+                self.rag_thinking_casual = False
+
         force_idle = False
         if self.rag_thinking_active and self.thinking_sound_pcm is not None:
             reply_pcm = self._next_thinking_sound_chunk()
@@ -2402,6 +2474,14 @@ class LiveHeliumFMOptions(BaseOptions):
                  "6.0s leaves comfortable margin above the worst latency actually measured.",
         )
         parser.add_argument(
+            "--thinking_sound_casual", type=int, default=1,
+            help="1 (default) also plays the thinking sound on casual turns that do not trigger a "
+                 "RAG search, covering the gap until the model starts speaking so the user always "
+                 "hears acknowledgement instead of silence. It stops as soon as the model's own "
+                 "audio crosses the speech threshold, so replies are never delayed or clipped. "
+                 "Set to 0 to restrict the thinking sound to RAG/web-search turns only.",
+        )
+        parser.add_argument(
             "--web_search_min_score", type=float, default=0.15,
             help="Discard web-search results scoring below this relevance floor before summarizing/"
                  "injecting them. Forensic logs showed clearly-irrelevant web results scoring 0.04-0.13 "
@@ -2583,6 +2663,7 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                 conversation_log_dir=getattr(args, "conversation_log_dir", ""),
                 thinking_sound_path=getattr(args, "thinking_sound_path", ""),
                 rag_max_filler_sec=float(getattr(args, "rag_max_filler_sec", 6.0)),
+                thinking_sound_casual=bool(int(getattr(args, "thinking_sound_casual", 1))),
             )
         return moshi_engine
 
