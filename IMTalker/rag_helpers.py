@@ -149,6 +149,17 @@ def summarize_context(
     full_text = " ".join(c["text"] for c in retrieved_chunks)
     sentences = re.split(r"(?<=[.!?])\s+", full_text.strip())
     sentences = [s.strip() for s in sentences if len(s.strip()) > 15]
+    # Web-scraped passages frequently end mid-fragment -- the text after the
+    # last '.'/'!'/'?' in the source is often nav/alt-text junk with no
+    # sentence punctuation of its own (confirmed via conversation_logs_5:
+    # a gold-price query pulled in a trailing fragment reading "Image 13:
+    # Dollar IconCalculate Gold ValueImage 14: Bell", which scored high on
+    # keyword overlap and was read into the assistant's <ref> context
+    # verbatim). Prefer properly terminated sentences; only fall back to the
+    # unfiltered list if that would leave nothing to summarize from.
+    terminated = [s for s in sentences if s.endswith((".", "!", "?"))]
+    if terminated:
+        sentences = terminated
     if not sentences:
         return full_text[:max_chars]
 
@@ -350,12 +361,22 @@ class ContextCompressor:
         result = _SYMBOL_RE.sub("", result).strip()
         result = re.sub(r"^[\-•\d\.\)]+\s*", "", result)
         if "NO_CONTEXT" in result or not result:
+            # Logged so a fallback-to-extractive-summary event (visible in
+            # the conversation log as compressor fallback=True) can be traced
+            # back to why the LLM answer was discarded -- previously this
+            # rejection left no trace anywhere (confirmed gap hit while
+            # diagnosing conversation_logs_5's turn 4).
+            print(f"[rag_helpers][compressor] rejected (NO_CONTEXT/empty): {result!r}", flush=True)
             return ""
 
         passage_words = set(w.lower() for c in chunks[: self.max_passages] for w in c["text"].split())
         answer_words = set(w.lower().strip(".,!?") for w in result.split())
         overlap = len(answer_words & passage_words) / max(1, len(answer_words))
         if overlap < 0.15:
+            print(
+                f"[rag_helpers][compressor] rejected (low overlap={overlap:.2f}): {result!r}",
+                flush=True,
+            )
             return ""
         return result
 
